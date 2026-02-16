@@ -1,0 +1,58 @@
+networks:
+  apps-infra:
+    name: apps-infra
+
+services:
+  # === Docker Registry (local image cache) ===
+  registry:
+    image: registry:2
+    container_name: apps-registry
+    restart: unless-stopped
+    networks:
+      - apps-infra
+    ports:
+      - "5000:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+
+  # === Self-Hosted GitHub Actions Runner ===
+  # 1. Create infrastructure/.env with ACCESS_TOKEN and REPO_URL
+  # 2. Start: docker compose -f infrastructure/docker-compose.yml --profile runner up -d
+  runner:
+    build:
+      context: .
+      dockerfile: runner.Dockerfile
+    image: apps-github-runner:latest
+    container_name: apps-github-runner
+    restart: unless-stopped
+    networks:
+      - apps-infra
+    environment:
+      - RUNNER_NAME=homeserver-runner
+      - RUNNER_WORKDIR=/tmp/runner/work
+      # PAT with 'repo' scope — auto-registers the runner
+      - ACCESS_TOKEN=${ACCESS_TOKEN:-}
+      - RUNNER_SCOPE=repo
+      - REPO_URL=${REPO_URL:-}
+      - LABELS=self-hosted,linux,homeserver
+      - DISABLE_AUTO_UPDATE=true
+      # EPHEMERAL must be unset (not "false") — the runner image checks -n, not value
+      # - EPHEMERAL=true
+      # Ensure scripts can find yq
+      - PATH=${HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    volumes:
+      # Docker socket — so runner can manage containers on the host
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-work:/tmp/runner/work
+      # Mount apps dir at SAME host path — critical for docker compose
+      # build contexts and file paths to resolve correctly on the host daemon
+      # UPDATE THIS to match your APPS_ROOT path:
+      - /path/to/apps:/path/to/apps
+      # yq binary (install with setup-network.sh first)
+      - ${HOME}/bin:${HOME}/bin:ro
+    profiles:
+      - runner
+
+volumes:
+  registry-data:
+  runner-work:

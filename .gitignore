@@ -1,0 +1,13 @@
+# Deployed apps (managed by scripts)
+deployments/*/
+
+# Secrets
+config/secrets/*/
+infrastructure/.env
+
+# Deploy artifacts
+*.rollback
+
+# OS
+.DS_Store
+Thumbs.db
