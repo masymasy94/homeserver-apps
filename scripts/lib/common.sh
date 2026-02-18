@@ -35,11 +35,17 @@ COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APPS_ROOT="$(cd "${COMMON_DIR}/../.." && pwd)"
 SETTINGS_FILE="${APPS_ROOT}/config/settings.conf"
 
+_SAVED_GIT_BRANCH="${GIT_BRANCH:-}"
 if [[ -f "$SETTINGS_FILE" ]]; then
     source "$SETTINGS_FILE"
 else
     fatal "Settings file not found: ${SETTINGS_FILE}"
 fi
+# Restore CI-provided branch override (settings.conf must not clobber it)
+if [[ -n "$_SAVED_GIT_BRANCH" ]]; then
+    GIT_BRANCH="$_SAVED_GIT_BRANCH"
+fi
+unset _SAVED_GIT_BRANCH
 
 # Re-export computed paths (settings.conf may reference APPS_ROOT)
 DEPLOYMENTS_DIR="${APPS_ROOT}/deployments"

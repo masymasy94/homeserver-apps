@@ -21,6 +21,8 @@ APP_DIR=$(get_app_dir "$APP_NAME")
 DEPLOY_COMPOSE=$(get_compose_file "$APP_NAME")
 
 # ─── Pull latest ───
+# Allow git to operate on repos owned by a different user (e.g. runner container as root)
+git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
 if [[ -d "${APP_DIR}/.git" ]] && git -C "$APP_DIR" remote get-url origin &>/dev/null; then
     info "Pulling latest changes (branch: ${GIT_BRANCH})..."
     # For private repos: temporarily set token-authenticated URL for fetch
@@ -30,7 +32,7 @@ if [[ -d "${APP_DIR}/.git" ]] && git -C "$APP_DIR" remote get-url origin &>/dev/
             git -C "$APP_DIR" remote set-url origin "${ORIGIN_URL/https:\/\/github.com/https://${ACCESS_TOKEN}@github.com}"
         fi
     fi
-    git -C "$APP_DIR" fetch origin "$GIT_BRANCH"
+    git -C "$APP_DIR" fetch origin "$GIT_BRANCH":"refs/remotes/origin/${GIT_BRANCH}" 2>&1 | while read -r line; do echo "  $line"; done
     git -C "$APP_DIR" reset --hard "origin/${GIT_BRANCH}" 2>&1 | while read -r line; do echo "  $line"; done
     # Restore clean URL (without token)
     if [[ -n "${ACCESS_TOKEN:-}" ]] && [[ -n "${ORIGIN_URL:-}" ]]; then
