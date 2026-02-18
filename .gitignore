@@ -1,8 +1,10 @@
 # Deployed apps (managed by scripts)
 deployments/*/
 
-# Secrets
+# Secrets & local config
 config/secrets/*/
+config/settings.conf
+config/apps.conf
 infrastructure/.env
 
 # Deploy artifacts
