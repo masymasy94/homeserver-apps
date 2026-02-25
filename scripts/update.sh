@@ -148,6 +148,13 @@ if ! docker compose -f "$DEPLOY_COMPOSE" -p "$APP_NAME" build 2>&1 | while read 
     fatal "Build failed. Running containers were NOT affected."
 fi
 
+# ─── Clean deploy: wipe volumes if requested (e.g. Flyway migration changes) ───
+if [[ "${CLEAN_DEPLOY:-false}" == "true" ]]; then
+    warn "CLEAN_DEPLOY requested — wiping all volumes (fresh database, fresh state)"
+    docker compose -f "$DEPLOY_COMPOSE" -p "$APP_NAME" down -v 2>&1 | while read -r line; do echo "  $line"; done
+    success "Volumes wiped — Flyway will run all migrations from scratch"
+fi
+
 # Deploy new images (--force-recreate ensures stale containers pick up new port bindings)
 info "Deploying new containers..."
 docker compose -f "$DEPLOY_COMPOSE" -p "$APP_NAME" up -d --force-recreate 2>&1 | while read -r line; do
