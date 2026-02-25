@@ -187,6 +187,22 @@ for svc in $(docker compose -f "$DEPLOY_COMPOSE" -p "$APP_NAME" config --service
     fi
 done
 
+# ─── HTTP smoke test — verify the site is actually reachable ───
+if [[ "$HEALTH_OK" == "true" ]] && [[ "${IP_ALIAS_ENABLED:-false}" == "true" ]] && [[ -n "$APP_IP" ]]; then
+    info "Running HTTP smoke test on http://${APP_IP}:${FRONTEND_PORT:-80}..."
+    # Allow extra time for Traefik/Sablier to settle
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "http://${APP_IP}:${FRONTEND_PORT:-80}/" 2>/dev/null || echo "000")
+    if [[ "$HTTP_CODE" == "000" ]]; then
+        warn "HTTP smoke test FAILED — connection refused on http://${APP_IP}:${FRONTEND_PORT:-80}/"
+        HEALTH_OK=false
+    elif [[ "$HTTP_CODE" == "502" ]] || [[ "$HTTP_CODE" == "503" ]]; then
+        warn "HTTP smoke test FAILED — got HTTP ${HTTP_CODE} on http://${APP_IP}:${FRONTEND_PORT:-80}/ (bad gateway / service unavailable)"
+        HEALTH_OK=false
+    else
+        success "HTTP smoke test passed (HTTP ${HTTP_CODE})"
+    fi
+fi
+
 if [[ "$HEALTH_OK" != "true" ]]; then
     warn "Health check failed — rolling back"
     docker compose -f "$DEPLOY_COMPOSE" -p "$APP_NAME" down 2>&1 | while read -r line; do echo "  $line"; done
