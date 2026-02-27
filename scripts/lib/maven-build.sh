@@ -7,11 +7,16 @@
 # Build order — update this to match your project's inter-service dependencies
 MAVEN_BUILD_ORDER=(
     "common"
-    # Add your services here in dependency order, e.g.:
-    # "notification-service"
-    # "user-service"
-    # "auth-service"
-    # "api-service"
+    "notification-service"
+    "user-service"
+    "auth-service"
+    "compendium-service"
+    "character-service"
+    "campaign-service"
+    "combat-service"
+    "asset-service"
+    "chat-service"
+    "search-service"
 )
 
 maven_build() {
