@@ -4,13 +4,17 @@
 # ─── Ensure ~/bin is in PATH (for yq) ───
 export PATH="${HOME}/bin:${PATH}"
 
-# ─── Load ACCESS_TOKEN from infrastructure/.env if not already set ───
+# ─── Load ACCESS_TOKEN from infrastructure/.env or Docker secret ───
 if [[ -z "${ACCESS_TOKEN:-}" ]]; then
     _infra_env="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/infrastructure/.env"
     if [[ -f "$_infra_env" ]]; then
-        ACCESS_TOKEN=$(grep '^ACCESS_TOKEN=' "$_infra_env" | cut -d= -f2-)
-        export ACCESS_TOKEN
+        ACCESS_TOKEN=$(grep '^ACCESS_TOKEN=' "$_infra_env" | cut -d= -f2- || true)
     fi
+    # Fallback: read from Docker secret (runner container)
+    if [[ -z "${ACCESS_TOKEN:-}" ]] && [[ -f /run/secrets/access_token ]]; then
+        ACCESS_TOKEN=$(tr -d '[:space:]' < /run/secrets/access_token)
+    fi
+    export ACCESS_TOKEN
 fi
 
 # ─── Colors ───

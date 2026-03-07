@@ -120,6 +120,57 @@ const JACKETT_LIMIT = 200;
 const TORRENTZ2_PAGES = 5;
 const STORAGE_KEY = 'prowlarr-search-indexers-v3';
 
+// Public trackers appended to all magnet links to speed up downloads
+const PUBLIC_TRACKERS = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://open.demonii.com:1337/announce',
+  'udp://open.stealth.si:80/announce',
+  'udp://exodus.desync.com:6969/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://tracker.openbittorrent.com:6969/announce',
+  'udp://tracker.tiny-vps.com:6969/announce',
+  'udp://explodie.org:6969/announce',
+  'udp://p4p.arenabg.com:1337/announce',
+  'udp://tracker.cyberia.is:6969/announce',
+];
+
+function enrichMagnet(magnet) {
+  if (!magnet || !magnet.startsWith('magnet:')) return magnet;
+  const extra = PUBLIC_TRACKERS
+    .filter(tr => !magnet.includes(encodeURIComponent(tr)))
+    .map(tr => '&tr=' + encodeURIComponent(tr))
+    .join('');
+  return magnet + extra;
+}
+
+// TNTVillage offline database (134K releases, loaded once)
+let tntData = null;
+async function loadTntvillage() {
+  if (tntData) return tntData;
+  const res = await fetch('/tntvillage.json');
+  if (!res.ok) throw new Error('TNTVillage data not available');
+  tntData = await res.json(); // [[hash, title, description, size], ...]
+  return tntData;
+}
+
+async function searchTntvillage(query) {
+  const data = await loadTntvillage();
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const results = [];
+  for (const [hash, title, desc, size] of data) {
+    const t = (title + ' ' + desc).toLowerCase();
+    if (words.every(w => t.includes(w))) {
+      const magnet = 'magnet:?xt=urn:btih:' + hash + '&dn=' + encodeURIComponent(title);
+      results.push({
+        title, size, seeders: -1, leechers: -1, indexer: 'TNTVillage',
+        downloadUrl: '', magnetUrl: enrichMagnet(magnet), infoUrl: '',
+      });
+    }
+    if (results.length >= 200) break;
+  }
+  return results;
+}
+
 // Jackett indexers enabled by default (best for general + Italian content)
 const JACKETT_DEFAULT_ON = new Set([
   '1337x', 'bitsearch', 'ilcorsaronero', 'ilcorsaroverde', 'kickasstorrents-to', 'kickasstorrents-ws',
@@ -161,6 +212,134 @@ function getInfohash(magnetUrl) {
   const match = magnetUrl.match(/btih:([a-fA-F0-9]{40})/i) ||
                 magnetUrl.match(/btih:([a-zA-Z2-7]{32})/i);
   return match ? match[1].toUpperCase() : null;
+}
+
+// Bencode parser — extracts info dict byte range for SHA1 hashing
+function bdecodeBuf(buf) {
+  const view = new Uint8Array(buf);
+  let infoStart = -1, infoEnd = -1;
+  function parse(pos) {
+    const ch = view[pos];
+    if (ch === 0x64) { // 'd'
+      const dict = {};
+      let p = pos + 1;
+      while (view[p] !== 0x65) {
+        const [key, keyEnd] = parse(p);
+        const vStart = keyEnd;
+        const [val, valEnd] = parse(keyEnd);
+        if (key === 'info') { infoStart = vStart; infoEnd = valEnd; }
+        dict[key] = val;
+        p = valEnd;
+      }
+      return [dict, p + 1];
+    }
+    if (ch === 0x6C) { // 'l'
+      const list = [];
+      let p = pos + 1;
+      while (view[p] !== 0x65) { const [val, end] = parse(p); list.push(val); p = end; }
+      return [list, p + 1];
+    }
+    if (ch === 0x69) { // 'i'
+      let p = pos + 1;
+      while (view[p] !== 0x65) p++;
+      return [parseInt(new TextDecoder().decode(view.slice(pos + 1, p)), 10), p + 1];
+    }
+    // string: len:data
+    let p = pos;
+    while (view[p] !== 0x3A) p++;
+    const len = parseInt(new TextDecoder().decode(view.slice(pos, p)), 10);
+    p++;
+    try { return [new TextDecoder('utf-8', {fatal:true}).decode(view.slice(p, p+len)), p+len]; }
+    catch { return [view.slice(p, p+len), p+len]; }
+  }
+  const [torrent] = parse(0);
+  return { torrent, infoStart, infoEnd };
+}
+
+async function torrentToMagnet(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Fetch failed');
+  // nginx intercepts 302 redirects and returns Location as body with X-Was-Redirect header
+  if (res.headers.get('X-Was-Redirect')) {
+    const loc = (await res.text()).trim();
+    if (loc.startsWith('magnet:')) return loc;
+    // Redirect was to an HTTP URL (e.g. .torrent file) — follow it
+    if (loc.startsWith('http')) return torrentToMagnet(loc);
+    throw new Error('Unknown redirect: ' + loc);
+  }
+  const ct = res.headers.get('Content-Type') || '';
+  // If HTML response, scrape for magnet links
+  if (ct.includes('text/html')) {
+    const html = await res.text();
+    const m = html.match(/magnet:\?xt=urn:btih:[^"'\s<>]+/);
+    if (m) return m[0].replace(/&amp;/g, '&');
+    throw new Error('No magnet in HTML');
+  }
+  // Otherwise treat as .torrent file
+  const buf = await res.arrayBuffer();
+  const { torrent, infoStart, infoEnd } = bdecodeBuf(buf);
+  if (infoStart < 0) throw new Error('No info dict');
+  const hashBuf = await crypto.subtle.digest('SHA-1', new Uint8Array(buf).slice(infoStart, infoEnd));
+  const hash = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  const name = typeof torrent.info?.name === 'string' ? torrent.info.name : '';
+  return 'magnet:?xt=urn:btih:' + hash + (name ? '&dn=' + encodeURIComponent(name) : '');
+}
+
+async function scrapeMagnet(pageUrl) {
+  const res = await fetch('/proxy/ext/?url=' + encodeURIComponent(pageUrl));
+  if (!res.ok) throw new Error('Scrape failed');
+  const html = await res.text();
+  const m = html.match(/magnet:\?xt=urn:btih:[^"'\s<>]+/);
+  if (m) return m[0].replace(/&amp;/g, '&');
+  throw new Error('No magnet on page');
+}
+
+async function scrapeMagnetFlare(pageUrl) {
+  const res = await fetch('/proxy/flare/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cmd: 'request.get', url: pageUrl, maxTimeout: 60000 }),
+  });
+  if (!res.ok) throw new Error('FlareSolverr failed');
+  const data = await res.json();
+  if (data.status !== 'ok') throw new Error('FlareSolverr error');
+  const html = data.solution?.response || '';
+  const m = html.match(/magnet:\?xt=urn:btih:[^"'\s<>]+/);
+  if (m) return m[0].replace(/&amp;/g, '&');
+  throw new Error('No magnet via FlareSolverr');
+}
+
+// Auto-resolve magnets for all results missing one (3 concurrent, 1 for FlareSolverr)
+let resolveGeneration = 0;
+async function resolveAllMagnets() {
+  const gen = ++resolveGeneration;
+  const toResolve = rawData.filter(r => !r.magnetUrl && (r.downloadUrl || r.infoUrl));
+  const needFlare = [];
+
+  // Phase 1: try Jackett proxy + direct scrape (fast, 3 concurrent)
+  for (let i = 0; i < toResolve.length; i += 3) {
+    if (gen !== resolveGeneration) return;
+    const batch = toResolve.slice(i, i + 3);
+    await Promise.all(batch.map(async (r) => {
+      if (r.downloadUrl) {
+        try { r.magnetUrl = await torrentToMagnet(r.downloadUrl); return; } catch {}
+      }
+      if (r.infoUrl) {
+        try { r.magnetUrl = await scrapeMagnet(r.infoUrl); return; } catch {}
+      }
+      if (r.infoUrl) needFlare.push(r);
+      else r.magnetUrl = 'failed';
+    }));
+    if (gen === resolveGeneration) renderTable();
+  }
+
+  // Phase 2: FlareSolverr fallback for remaining (1 at a time, slow)
+  for (const r of needFlare) {
+    if (gen !== resolveGeneration) return;
+    try { r.magnetUrl = await scrapeMagnetFlare(r.infoUrl); }
+    catch { r.magnetUrl = 'failed'; }
+    if (gen === resolveGeneration) renderTable();
+  }
 }
 
 // Deduplicate results by infohash, keeping highest seeders and merging indexer names
@@ -244,6 +423,7 @@ async function loadIndexers() {
   });
 
   allIndexers.push({ key: 'torrentz2', id: null, name: 'Torrentz2', source: 'torrentz2', checked: true });
+  allIndexers.push({ key: 'tntvillage', id: null, name: 'TNTVillage', source: 'tntvillage', checked: true });
 
   const saved = getSavedSelection();
   if (saved) {
@@ -263,6 +443,7 @@ function renderIndexerGrid() {
     { label: 'Prowlarr', source: 'prowlarr', dotClass: '' },
     { label: 'Jackett', source: 'jackett', dotClass: 'jackett' },
     { label: 'External', source: 'torrentz2', dotClass: 'torrentz2' },
+    { label: 'Offline', source: 'tntvillage', dotClass: 'torrentz2' },
   ];
 
   let html = '';
@@ -313,7 +494,7 @@ async function searchJackett(query, indexerId) {
       seeders: r.Seeders ?? -1,
       leechers: r.Peers != null ? r.Peers - (r.Seeders || 0) : -1,
       indexer: r.Tracker || indexerId,
-      downloadUrl: r.Link || '',
+      downloadUrl: (r.Link || '').replace(/^https?:\/\/jackett:9117\/dl\//, '/jackett-dl/'),
       magnetUrl: r.MagnetUri || '',
       infoUrl: r.Details || r.Comments || '',
     }));
@@ -378,8 +559,9 @@ async function doSearch() {
   const selProwlarr = allIndexers.filter(ix => ix.checked && ix.source === 'prowlarr');
   const selJackett = allIndexers.filter(ix => ix.checked && ix.source === 'jackett');
   const selTz2 = allIndexers.find(ix => ix.key === 'torrentz2')?.checked || false;
+  const selTnt = allIndexers.find(ix => ix.key === 'tntvillage')?.checked || false;
 
-  if (selProwlarr.length === 0 && selJackett.length === 0 && !selTz2) {
+  if (selProwlarr.length === 0 && selJackett.length === 0 && !selTz2 && !selTnt) {
     document.getElementById('status').className = 'error';
     document.getElementById('status').textContent = 'No indexers selected';
     return;
@@ -397,13 +579,14 @@ async function doSearch() {
 
   const prowlarrBatchCount = selProwlarr.length > 0 ? Math.ceil(selProwlarr.length / BATCH_SIZE) : 0;
   const jackettBatchCount = selJackett.length > 0 ? Math.ceil(selJackett.length / BATCH_SIZE) : 0;
-  const totalSources = prowlarrBatchCount + jackettBatchCount + (selTz2 ? 1 : 0);
+  const totalSources = prowlarrBatchCount + jackettBatchCount + (selTz2 ? 1 : 0) + (selTnt ? 1 : 0);
   let completed = 0;
 
   const parts = [];
   if (selProwlarr.length) parts.push(`${selProwlarr.length} Prowlarr`);
   if (selJackett.length) parts.push(`${selJackett.length} Jackett`);
   if (selTz2) parts.push('Torrentz2');
+  if (selTnt) parts.push('TNTVillage');
   status.textContent = `Searching ${parts.join(' + ')}...`;
 
   try {
@@ -420,7 +603,7 @@ async function doSearch() {
               seeders: r.seeders ?? -1, leechers: r.leechers ?? -1,
               indexer: r.indexer || '—', downloadUrl: r.downloadUrl || '',
               magnetUrl: r.magnetUrl || '', infoUrl: r.infoUrl || '',
-            })));
+            })).filter(r => matchesQuery(r.title)));
             completed++;
             progress.textContent = `${completed}/${totalSources} sources done — ${rawData.length} raw results`;
             renderTable();
@@ -434,7 +617,7 @@ async function doSearch() {
         const batch = selJackett.slice(i, i + BATCH_SIZE);
         promises.push(
           Promise.all(batch.map(ix => searchJackett(q, ix.id))).then(batchResults => {
-            batchResults.forEach(results => rawData.push(...results));
+            batchResults.forEach(results => rawData.push(...results.filter(r => matchesQuery(r.title))));
             completed++;
             progress.textContent = `${completed}/${totalSources} sources done — ${rawData.length} raw results`;
             renderTable();
@@ -446,7 +629,18 @@ async function doSearch() {
     if (selTz2) {
       promises.push(
         searchTorrentz2(q).then(results => {
-          rawData.push(...results);
+          rawData.push(...results.filter(r => matchesQuery(r.title)));
+          completed++;
+          progress.textContent = `${completed}/${totalSources} sources done — ${rawData.length} raw results`;
+          renderTable();
+        }).catch(() => { completed++; })
+      );
+    }
+
+    if (selTnt) {
+      promises.push(
+        searchTntvillage(q).then(results => {
+          rawData.push(...results.filter(r => matchesQuery(r.title)));
           completed++;
           progress.textContent = `${completed}/${totalSources} sources done — ${rawData.length} raw results`;
           renderTable();
@@ -457,6 +651,7 @@ async function doSearch() {
     await Promise.all(promises);
     progress.textContent = '';
     updateStatus();
+    resolveAllMagnets();
   } catch (err) {
     status.className = 'error';
     status.textContent = 'Error: ' + err.message;
@@ -471,26 +666,18 @@ function matchesQuery(title) {
 }
 
 function getDisplayData() {
-  const showAll = document.getElementById('showAll')?.checked || false;
   const dedup = document.getElementById('dedupToggle')?.checked ?? true;
-  let results = dedup ? deduplicateResults(rawData) : rawData.map(r => ({ ...r, indexers: [r.indexer], dedupCount: 1 }));
-  if (!showAll) results = results.filter(r => matchesQuery(r.title));
-  return results;
+  return dedup ? deduplicateResults(rawData) : rawData.map(r => ({ ...r, indexers: [r.indexer], dedupCount: 1 }));
 }
 
 function updateStatus() {
   const status = document.getElementById('status');
-  const showAll = document.getElementById('showAll')?.checked || false;
   const dedup = document.getElementById('dedupToggle')?.checked ?? true;
   const dedupResults = dedup ? deduplicateResults(rawData) : rawData;
-  const filtered = showAll ? dedupResults : dedupResults.filter(r => matchesQuery(r.title || r.title));
-  const hidden = rawData.length - filtered.length;
   const dedupCount = rawData.length - dedupResults.length;
   status.className = '';
-  let text = `${filtered.length} result${filtered.length !== 1 ? 's' : ''}`;
+  let text = `${dedupResults.length} result${dedupResults.length !== 1 ? 's' : ''}`;
   if (dedupCount > 0) text += ` (${dedupCount} duplicates merged)`;
-  const unrelatedCount = dedupResults.length - dedupResults.filter(r => matchesQuery(r.title || '')).length;
-  if (!showAll && unrelatedCount > 0) text += ` (${unrelatedCount} unrelated hidden)`;
   status.textContent = text;
 }
 
@@ -522,15 +709,10 @@ function renderTable() {
 
   updateStatus();
 
-  const showAll = document.getElementById('showAll')?.checked || false;
   const dedup = document.getElementById('dedupToggle')?.checked ?? true;
-  const hasUnrelated = rawData.some(r => !matchesQuery(r.title || ''));
 
   let html = '<div class="filter-row">';
   html += `<label><input type="checkbox" id="dedupToggle" onchange="renderTable()"${dedup ? ' checked' : ''}> Merge duplicates</label>`;
-  if (hasUnrelated) {
-    html += `<label><input type="checkbox" id="showAll" onchange="renderTable()"${showAll ? ' checked' : ''}> Show unrelated</label>`;
-  }
   html += '</div>';
 
   html += '<table><thead><tr>';
@@ -542,11 +724,16 @@ function renderTable() {
   html += '</tr></thead><tbody>';
 
   for (const r of sorted) {
-    const link = r.magnetUrl || r.downloadUrl;
-    const linkLabel = r.magnetUrl ? 'Magnet' : (r.downloadUrl ? 'Torrent' : '');
-    const dlCell = link
-      ? `<a class="dl" href="${escHtml(link)}">${linkLabel}</a>`
-      : '<span class="muted">—</span>';
+    let dlCell;
+    if (r.magnetUrl && r.magnetUrl !== 'failed') {
+      dlCell = `<a class="dl" href="${escHtml(enrichMagnet(r.magnetUrl))}">Magnet</a>`;
+    } else if (r.magnetUrl === 'failed') {
+      dlCell = '<span class="muted" style="color:#ff6b6b">N/A</span>';
+    } else if (r.downloadUrl || r.infoUrl) {
+      dlCell = '<span class="muted" style="color:#ffa94d">...</span>';
+    } else {
+      dlCell = '<span class="muted">—</span>';
+    }
     const titleCell = r.infoUrl
       ? `<a class="dl" href="${escHtml(r.infoUrl)}" target="_blank" rel="noopener">${escHtml(r.title)}</a>`
       : escHtml(r.title);

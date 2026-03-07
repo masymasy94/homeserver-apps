@@ -24,3 +24,10 @@ RUN curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/b
 
 # Verify
 RUN java -version && mvn --version
+
+# Wrapper entrypoint: reads secret file, cleans stale config, then calls original
+COPY entrypoint-wrapper.sh /entrypoint-wrapper.sh
+RUN chmod +x /entrypoint-wrapper.sh
+
+ENTRYPOINT ["/entrypoint-wrapper.sh"]
+CMD ["./bin/Runner.Listener", "run", "--startuptype", "service"]
